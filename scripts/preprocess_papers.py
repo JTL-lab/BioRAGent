@@ -6,7 +6,7 @@ import pymupdf
 import numpy as np
 from tqdm import tqdm
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf, col, explode
+from pyspark.sql.functions import udf, col, explode, lit
 from pyspark.sql.types import StringType, StructType, StructField, ArrayType
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from oci.generative_ai_inference import GenerativeAiInferenceClient
@@ -189,8 +189,7 @@ def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_process
     pdf_df = pdf_df.withColumn("metadata", extract_metadata_udf(col("file_name"), col("clean_text")))
     
     # 4) Semantic chunking prior to processing with RAG agent (need to consider max chunk sizes)
-    pdf_df = pdf_df.withColumn("semantic_chunks", semantic_chunk_udf(col("clean_text"), col("metadata"), 
-                                                                     chunk_size=chunk_size, chunk_overlap=chunk_overlap))
+    pdf_df = pdf_df.withColumn("semantic_chunks", semantic_chunk_udf(col("clean_text"), col("metadata"), lit(chunk_size), lit(chunk_overlap)))
     
     # 5) For storage in parquet, make one row per chunk
     final_df = pdf_df.select(
