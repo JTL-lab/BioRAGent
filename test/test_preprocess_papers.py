@@ -11,9 +11,9 @@ def test_preprocessing():
     """
     Test the PDF preprocessing function with a small subset.
     """
-    df = run_spark_pdf_preprocessing(pdf_dir='', max_files=5)
-    df.select("file_name", "text").show(5, truncate=False)
-    df.select("file_name", col("text").substr(1, 100).alias("text_sample")).show(5)
+    df = run_spark_pdf_preprocessing(pdf_dir='', max_files=10)
+    df.select("file_name", "chunk_text").show(10, truncate=False)
+    df.select("file_name", col("chunk_text").substr(1, 100).alias("text_sample")).show(10)
     sample_file = df.select("file_path").first()[0]
     manual_text = extract_text_from_pdf(sample_file)
 
