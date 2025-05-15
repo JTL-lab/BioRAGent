@@ -5,8 +5,9 @@ import pymupdf
 import numpy as np
 from tqdm import tqdm
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import udf, col
-from pyspark.sql.types import StringType, StructType, StructField
+from pyspark.sql.functions import udf, col, explode
+from pyspark.sql.types import StringType, StructType, StructField, ArrayType
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from oci.generative_ai_inference import GenerativeAiInferenceClient
 
 
@@ -30,7 +31,7 @@ def extract_text_udf(pdf_path):
     return extract_text_from_pdf(pdf_path)
 
 
-def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_processed_papers.parquet"):
+def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_processed_papers.parquet", chunk_size=2000, chunk_overlap=100):
     """
     Process PDF files using PySpark and extract text
     
@@ -38,9 +39,11 @@ def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_process
         pdf_dir (str): Path to directory containing PDF files.
         max_files (int): Maximum number of files to process. 
         output_path (str): Path to output directory to save resulting preprocessed data parquet file.
+        chunk_size (int): Size of each chunk in characters.
+        chunk_overlap (int): Overlap between chunks in characters.
     
     Returns:
-        pdf_df (pd.DataFrame): DataFrame of PDF text content, with one PDF per row. 
+        final_df (pd.DataFrame): DataFrame of chunked PDF text content.
     """
     spark = SparkSession.builder \
         .appName("BioRAGent-TextProcessing-Test") \
@@ -61,18 +64,41 @@ def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_process
 
     pdf_df = spark.createDataFrame(pdf_files, schema)
     pdf_df = pdf_df.withColumn("text", extract_text_udf(col("file_path")))
+    pdf_df = pdf_df.filter(col("text").isNotNull() & (col("text") != ""))
 
-    total_files = pdf_df.count()
-    successful_extractions = pdf_df.filter(col("text").isNotNull() & (col("text") != "")).count()    
-    print(f"Total files processed: {total_files}")
-    print(f"Successful extractions: {successful_extractions}")
-    print(f"Failed extractions: {total_files - successful_extractions}")
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
+    
+    # UDF for chunking text!
+    @udf(returnType=ArrayType(StringType()))
+    def chunk_text_udf(text):
+        if not text or len(text.strip()) == 0:
+            return []
+        return text_splitter.split_text(text)
+    
+    chunked_pdf_df = pdf_df.withColumn("chunks", chunk_text_udf(col("text")))
+    final_df = chunked_pdf_df.select(
+        col("file_path"),
+        col("file_name"),
+        explode(col("chunks")).alias("chunk_text"),
+        col("metadata")
+    )
+    
+    total_chunks = final_df.count()
+    total_docs = pdf_df.count()
+    print(f"Total documents processed: {total_docs}")
+    print(f"Total chunks generated: {total_chunks}")
+    print(f"Average chunks per document: {total_chunks/total_docs:.2f}")
     
     if output_path:
-        pdf_df.write.mode("overwrite").parquet(output_path)
-        print(f"Saved test results to {output_path}")
+        final_df.write.mode("overwrite").parquet(output_path)
+        print(f"Saved chunked results to {output_path}")
     
-    return pdf_df
+    return final_df
 
 
 if __name__ == '__main__':
