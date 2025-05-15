@@ -1,4 +1,5 @@
 import os
+import re
 import oci
 import json
 import pymupdf
@@ -29,6 +30,119 @@ def extract_text_from_pdf(pdf_path):
 @udf(returnType=StringType())
 def extract_text_udf(pdf_path):
     return extract_text_from_pdf(pdf_path)
+
+
+@udf(returnType=StringType())
+def clean_pdf_text_udf(text):
+    if not text:
+        return ""
+    
+    text = re.sub(r'\|\d+\.\d+v\d+\.pdf\|', '', text)                                      # PDF file markers (e.g., |2412.19191v1.pdf|)
+    text = re.sub(r'arXiv:\d+\.\d+v\d+\s+\[\w+-?\w*\.\w+\]\s+\d+\s+\w+\s+\d{4}', '', text) # arXiv identifiers
+    text = re.sub(r'(\w+)-\n(\w+)', r'\1\2', text)                                         # hyphenated words at line breaks
+    text = re.sub(r'\n\n+', '[PARA]', text)                                                # replace multiple newlines with paragraph markers
+    text = re.sub(r'\n', ' ', text)                                                        # replace single newlines with spaces
+    text = re.sub(r'\n(?=[a-z])', ' ', text)                                               # get rid of newlines that occur mid-sentence just signifying a natural newline in formatting,
+    text = re.sub(r'([^.!?])\n([^A-Z])', r'\1 \2', text)                                   # but still keep structural newlines (e.g. after a period, followed by uppercase suggesting new paragraph, etc.)
+    text = text.replace('[PARA]', '\n\n')                                                  # restore paragraph breaks
+    text = re.sub(r'\s+', ' ', text)                                                       # fix spacing issues
+    text = re.sub(r'\s*\.\s*', '. ', text)
+    text = re.sub(r'\s*,\s*', ', ', text)
+
+    # arXiv articles can have some other weird symbols after being preprocessed with pymupdf so need to handle these too
+    text = re.sub(r'•', '- ', text)  # bullet points
+    text = re.sub(r'…', '...', text)  # ellipses
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)  # get rid of any control chars
+    
+    return text.strip()
+
+
+@udf(returnType=StringType())
+def extract_metadata_udf(file_name, text):
+    metadata = {"file_name": file_name} # Filename 
+    # See if we can find the title within the text
+    title_match = re.search(r'(?:TITLE:|^)([^\n]+)', text, re.IGNORECASE)
+    if title_match:
+        metadata["title"] = title_match.group(1).strip()
+    
+    # Try to find abstract
+    abstract_match = re.search(r'(?:ABSTRACT|Summary)(?:\s*\n+\s*)(.*?)(?:\n\n|\n\d\.|\nINTRODUCTION)', 
+                                text, re.IGNORECASE | re.DOTALL)
+    if abstract_match:
+        metadata["abstract"] = abstract_match.group(1).strip()
+    
+    # also store arXiv ID if present
+    arxiv_match = re.search(r'arXiv:(\d+\.\d+v\d+)', text)
+    if arxiv_match:
+        metadata["arxiv_id"] = arxiv_match.group(1)
+    
+    return json.dumps(metadata)
+
+
+@udf(returnType=ArrayType(StructType([
+        StructField("chunk_text", StringType(), True),
+        StructField("chunk_metadata", StringType(), True)
+    ])))
+def semantic_chunk_udf(text, metadata_json, chunk_size=2000, chunk_overlap=100):
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", ".", " ", ""]  # try to split on paragraphs first, but end of sentences if not, and worst case after word
+    )
+    
+    if not text or len(text.strip()) == 0:
+        return []
+    
+    try:
+        metadata = json.loads(metadata_json)
+    except:
+        metadata = {}
+        
+    sections = []
+    section_matches = re.finditer(r'(?:\n|\A)(\d+(?:\.\d+)?[\s\t]+[A-Z][A-Z\s]+)(?:\n|\Z)', text) # check for section headers (e.g., "1. INTRODUCTION", "2.1 METHODS")
+    last_pos = 0
+    section_positions = []
+    
+    for match in section_matches:
+        section_positions.append((last_pos, match.start(), None))
+        last_pos = match.start()
+        section_positions.append((match.start(), match.end(), match.group(1).strip()))
+    section_positions.append((last_pos, len(text), None))
+    
+    # ideally use sections when possible for chunking to maintain semantic units
+    chunks_with_metadata = []
+    if len(section_positions) > 1:
+        for start, end, section_title in section_positions:
+            section_text = text[start:end].strip()
+            if not section_text:
+                continue
+                
+            if len(section_text) > chunk_size:
+                section_chunks = text_splitter.split_text(section_text)
+                for i, chunk in enumerate(section_chunks):
+                    chunk_meta = metadata.copy()
+                    if section_title:
+                        chunk_meta["section"] = section_title
+                    chunk_meta["chunk_index"] = i
+                    chunks_with_metadata.append({"chunk_text": chunk, 
+                                                "chunk_metadata": json.dumps(chunk_meta)})
+            else:
+                chunk_meta = metadata.copy()
+                if section_title:
+                    chunk_meta["section"] = section_title
+                chunks_with_metadata.append({"chunk_text": section_text, 
+                                            "chunk_metadata": json.dumps(chunk_meta)})
+    else:
+        # If no sections found, fall back to standard chunking
+        regular_chunks = text_splitter.split_text(text)
+        for i, chunk in enumerate(regular_chunks):
+            chunk_meta = metadata.copy()
+            chunk_meta["chunk_index"] = i
+            chunks_with_metadata.append({"chunk_text": chunk, 
+                                        "chunk_metadata": json.dumps(chunk_meta)})
+            
+    return chunks_with_metadata
 
 
 def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_processed_papers.parquet", chunk_size=2000, chunk_overlap=100):
@@ -63,29 +177,31 @@ def run_spark_pdf_preprocessing(pdf_dir, max_files=10, output_path="test_process
     print(f"Processing {len(pdf_files)} PDF files for testing")
 
     pdf_df = spark.createDataFrame(pdf_files, schema)
+
+    # 1) Extract all text using extraction UDF
     pdf_df = pdf_df.withColumn("text", extract_text_udf(col("file_path")))
     pdf_df = pdf_df.filter(col("text").isNotNull() & (col("text") != ""))
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        separators=["\n\n", "\n", " ", ""]
-    )
+    # 2) Clean the extracted text
+    pdf_df = pdf_df.withColumn("clean_text", clean_pdf_text_udf(col("text")))
     
-    # UDF for chunking text!
-    @udf(returnType=ArrayType(StringType()))
-    def chunk_text_udf(text):
-        if not text or len(text.strip()) == 0:
-            return []
-        return text_splitter.split_text(text)
+    # 3) Retain metadata from text
+    pdf_df = pdf_df.withColumn("metadata", extract_metadata_udf(col("file_name"), col("clean_text")))
     
-    chunked_pdf_df = pdf_df.withColumn("chunks", chunk_text_udf(col("text")))
-    final_df = chunked_pdf_df.select(
+    # 4) Semantic chunking prior to processing with RAG agent (need to consider max chunk sizes)
+    pdf_df = pdf_df.withColumn("semantic_chunks", semantic_chunk_udf(col("clean_text"), col("metadata"), 
+                                                                     chunk_size=chunk_size, chunk_overlap=chunk_overlap))
+    
+    # 5) For storage in parquet, make one row per chunk
+    final_df = pdf_df.select(
         col("file_path"),
         col("file_name"),
-        explode(col("chunks")).alias("chunk_text"),
-        col("metadata")
+        explode(col("semantic_chunks")).alias("chunk_data")
+    ).select(
+        col("file_path"),
+        col("file_name"),
+        col("chunk_data.chunk_text"),
+        col("chunk_data.chunk_metadata")
     )
     
     total_chunks = final_df.count()
@@ -109,4 +225,3 @@ if __name__ == '__main__':
     #print("Step 1: Preprocessing PDFs with PySpark...")
     #pdf_df = run_spark_pdf_preprocessing()
     #print(f"We have successfully processed {pdf_df.count()} PDF documents.")
-
